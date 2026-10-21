@@ -13,7 +13,7 @@ import io
 import json
 import os
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import colorchooser, filedialog, messagebox, simpledialog
 
 try:
     from PIL import Image, ImageTk
@@ -34,11 +34,27 @@ HIGHLIGHT = "#fff07a"
 ACCENT = "#2f5bd3"
 COLORS = [("Ink", "#1b2b30"), ("Red", "#c8402d"), ("Blue", "#2f5bd3"), ("Green", "#2f8f5b")]
 FILLS = [("None", None), ("Yellow", "#fff3a3"), ("Pink", "#ffd6c9"), ("Blue", "#cfe8ff"), ("Green", "#d5f5dc")]
-APP_VERSION = "1.2"
-# (name, board colour, grid colour). Light only, so the default dark ink stays readable.
-BOARD_COLORS = [("Paper", "#eef2f0", "#d3dbd8"), ("White", "#ffffff", "#e2e6e5"),
-                ("Kraft", "#efe3cc", "#d9c9ab"), ("Sage", "#e1ebe1", "#c6d6c6"),
-                ("Sky", "#e3eef8", "#c4d6e8")]
+APP_VERSION = "1.3"
+BOARD_DEFAULT = "#eef2f0"
+OLD_BOARD_NAMES = {"Paper": "#eef2f0", "White": "#ffffff", "Kraft": "#efe3cc",
+                   "Sage": "#e1ebe1", "Sky": "#e3eef8"}
+
+
+def grid_for(hexv):
+    """A slightly darker shade of the board colour, used for the grid lines."""
+    r, g, b = (int(hexv[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % tuple(int(v * 0.9) for v in (r, g, b))
+
+
+def load_board(value):
+    """Accepts a hex colour, or an old preset name from version 1.2 files."""
+    if isinstance(value, str) and len(value) == 7 and value.startswith("#"):
+        try:
+            int(value[1:], 16)
+            return value.lower()
+        except ValueError:
+            pass
+    return OLD_BOARD_NAMES.get(value, BOARD_DEFAULT)
 FONT = ("Georgia", 16)
 STROKE_TYPES = ("stroke", "highlight")
 LINE_TYPES = ("line", "arrow")
@@ -70,7 +86,7 @@ class DraftingTable:
         self.tool = "select"
         self.color = COLORS[0][1]
         self.fill = None
-        self.board = BOARD_COLORS[0]
+        self.board = BOARD_DEFAULT
         self.drag = None
         self.path = None
         self.dirty = False
@@ -85,7 +101,7 @@ class DraftingTable:
                            "color": COLORS[0][1], "pinned": False})
         self.set_tool("select")
         self.set_color(self.color)
-        self.set_board(BOARD_COLORS[0][0], mark=False)
+        self.set_board(BOARD_DEFAULT, mark=False)
         self.redraw()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -120,12 +136,7 @@ class DraftingTable:
             b.pack(side=tk.LEFT, padx=2)
             self.fill_buttons[fhex] = b
         tk.Frame(bar, width=14).pack(side=tk.LEFT)
-        tk.Label(bar, text="Board:").pack(side=tk.LEFT)
-        self.board_buttons = {}
-        for bname, _bcol, _gcol in BOARD_COLORS:
-            b = tk.Button(bar, text=bname, width=7, command=lambda n=bname: self.set_board(n))
-            b.pack(side=tk.LEFT, padx=2)
-            self.board_buttons[bname] = b
+        tk.Button(bar, text="Board colour...", command=self.pick_board).pack(side=tk.LEFT, padx=2)
 
         bar2 = tk.Frame(self.root, padx=8)
         bar2.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
@@ -205,19 +216,19 @@ class DraftingTable:
             self.push_undo(pre)
         self.redraw()
 
-    def set_board(self, name, mark=True):
-        found = [t for t in BOARD_COLORS if t[0] == name]
-        if not found:
-            return
-        self.board = found[0]
-        self.canvas.config(bg=self.board[1])
-        self.canvas.itemconfig("grid", fill=self.board[2])
-        for n, b in self.board_buttons.items():
-            b.config(relief=tk.SUNKEN if n == name else tk.RAISED)
+    def set_board(self, hexv, mark=True):
+        self.board = hexv
+        self.canvas.config(bg=hexv)
+        self.canvas.itemconfig("grid", fill=grid_for(hexv))
         if mark:
             self.dirty = True
-            self.flash(f"Board colour: {name}")
+            self.flash(f"Board colour: {hexv}")
         self.update_status()
+
+    def pick_board(self):
+        _rgb, hexv = colorchooser.askcolor(initialcolor=self.board, title="Board colour", parent=self.root)
+        if hexv:
+            self.set_board(hexv.lower())
 
     def set_fill(self, hexv):
         self.fill = hexv
@@ -691,7 +702,7 @@ class DraftingTable:
             if not path:
                 return False
             self.path = path
-        data = {"version": 1, "board": self.board[0], "items": [self.serialize(it) for it in self.items]}
+        data = {"version": 1, "board": self.board, "items": [self.serialize(it) for it in self.items]}
         try:
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump(data, f)
@@ -718,7 +729,7 @@ class DraftingTable:
         except Exception as err:
             messagebox.showerror("Open failed", str(err))
             return
-        self.set_board(data.get("board", BOARD_COLORS[0][0]), mark=False)
+        self.set_board(load_board(data.get("board")), mark=False)
         self.items = items
         self.sel = set()
         self.undo_stack = []
