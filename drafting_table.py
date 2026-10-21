@@ -34,7 +34,11 @@ HIGHLIGHT = "#fff07a"
 ACCENT = "#2f5bd3"
 COLORS = [("Ink", "#1b2b30"), ("Red", "#c8402d"), ("Blue", "#2f5bd3"), ("Green", "#2f8f5b")]
 FILLS = [("None", None), ("Yellow", "#fff3a3"), ("Pink", "#ffd6c9"), ("Blue", "#cfe8ff"), ("Green", "#d5f5dc")]
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
+# (name, board colour, grid colour). Light only, so the default dark ink stays readable.
+BOARD_COLORS = [("Paper", "#eef2f0", "#d3dbd8"), ("White", "#ffffff", "#e2e6e5"),
+                ("Kraft", "#efe3cc", "#d9c9ab"), ("Sage", "#e1ebe1", "#c6d6c6"),
+                ("Sky", "#e3eef8", "#c4d6e8")]
 FONT = ("Georgia", 16)
 STROKE_TYPES = ("stroke", "highlight")
 LINE_TYPES = ("line", "arrow")
@@ -66,6 +70,7 @@ class DraftingTable:
         self.tool = "select"
         self.color = COLORS[0][1]
         self.fill = None
+        self.board = BOARD_COLORS[0]
         self.drag = None
         self.path = None
         self.dirty = False
@@ -80,6 +85,7 @@ class DraftingTable:
                            "color": COLORS[0][1], "pinned": False})
         self.set_tool("select")
         self.set_color(self.color)
+        self.set_board(BOARD_COLORS[0][0], mark=False)
         self.redraw()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -113,6 +119,13 @@ class DraftingTable:
                           command=lambda c=fhex: self.set_fill(c))
             b.pack(side=tk.LEFT, padx=2)
             self.fill_buttons[fhex] = b
+        tk.Frame(bar, width=14).pack(side=tk.LEFT)
+        tk.Label(bar, text="Board:").pack(side=tk.LEFT)
+        self.board_buttons = {}
+        for bname, _bcol, _gcol in BOARD_COLORS:
+            b = tk.Button(bar, text=bname, width=7, command=lambda n=bname: self.set_board(n))
+            b.pack(side=tk.LEFT, padx=2)
+            self.board_buttons[bname] = b
 
         bar2 = tk.Frame(self.root, padx=8)
         bar2.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
@@ -191,6 +204,20 @@ class DraftingTable:
                 it["color"] = hexv
             self.push_undo(pre)
         self.redraw()
+
+    def set_board(self, name, mark=True):
+        found = [t for t in BOARD_COLORS if t[0] == name]
+        if not found:
+            return
+        self.board = found[0]
+        self.canvas.config(bg=self.board[1])
+        self.canvas.itemconfig("grid", fill=self.board[2])
+        for n, b in self.board_buttons.items():
+            b.config(relief=tk.SUNKEN if n == name else tk.RAISED)
+        if mark:
+            self.dirty = True
+            self.flash(f"Board colour: {name}")
+        self.update_status()
 
     def set_fill(self, hexv):
         self.fill = hexv
@@ -664,7 +691,7 @@ class DraftingTable:
             if not path:
                 return False
             self.path = path
-        data = {"version": 1, "items": [self.serialize(it) for it in self.items]}
+        data = {"version": 1, "board": self.board[0], "items": [self.serialize(it) for it in self.items]}
         try:
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump(data, f)
@@ -691,6 +718,7 @@ class DraftingTable:
         except Exception as err:
             messagebox.showerror("Open failed", str(err))
             return
+        self.set_board(data.get("board", BOARD_COLORS[0][0]), mark=False)
         self.items = items
         self.sel = set()
         self.undo_stack = []
