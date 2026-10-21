@@ -33,6 +33,8 @@ GRID = "#d3dbd8"
 HIGHLIGHT = "#fff07a"
 ACCENT = "#2f5bd3"
 COLORS = [("Ink", "#1b2b30"), ("Red", "#c8402d"), ("Blue", "#2f5bd3"), ("Green", "#2f8f5b")]
+FILLS = [("None", None), ("Yellow", "#fff3a3"), ("Pink", "#ffd6c9"), ("Blue", "#cfe8ff"), ("Green", "#d5f5dc")]
+APP_VERSION = "1.1"
 FONT = ("Georgia", 16)
 STROKE_TYPES = ("stroke", "highlight")
 LINE_TYPES = ("line", "arrow")
@@ -63,6 +65,7 @@ class DraftingTable:
         self.sel = set()
         self.tool = "select"
         self.color = COLORS[0][1]
+        self.fill = None
         self.drag = None
         self.path = None
         self.dirty = False
@@ -102,6 +105,14 @@ class DraftingTable:
                           activeforeground="white", width=6, command=lambda c=hexv: self.set_color(c))
             b.pack(side=tk.LEFT, padx=2)
             self.color_buttons[hexv] = b
+        tk.Frame(bar, width=14).pack(side=tk.LEFT)
+        tk.Label(bar, text="Note fill:").pack(side=tk.LEFT)
+        self.fill_buttons = {}
+        for fname, fhex in FILLS:
+            b = tk.Button(bar, text=fname, bg=fhex or "#ffffff", width=7,
+                          command=lambda c=fhex: self.set_fill(c))
+            b.pack(side=tk.LEFT, padx=2)
+            self.fill_buttons[fhex] = b
 
         bar2 = tk.Frame(self.root, padx=8)
         bar2.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
@@ -178,6 +189,18 @@ class DraftingTable:
             pre = self.snapshot()
             for it in targets:
                 it["color"] = hexv
+            self.push_undo(pre)
+        self.redraw()
+
+    def set_fill(self, hexv):
+        self.fill = hexv
+        for h, b in self.fill_buttons.items():
+            b.config(relief=tk.SUNKEN if h == hexv else tk.RAISED)
+        targets = [it for it in self.items if it["id"] in self.sel and it["type"] == "text"]
+        if targets:
+            pre = self.snapshot()
+            for it in targets:
+                it["bg"] = hexv
             self.push_undo(pre)
         self.redraw()
 
@@ -431,7 +454,7 @@ class DraftingTable:
             return
         pre = self.snapshot()
         it = {"id": self.new_id(), "type": "text", "x": round(x), "y": round(y), "text": text,
-              "color": self.color, "pinned": False}
+              "color": self.color, "bg": self.fill, "pinned": False}
         self.items.append(it)
         self.sel = {it["id"]}
         self.push_undo(pre)
