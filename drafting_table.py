@@ -32,7 +32,7 @@ except Exception:
     Image = ImageTk = ImageGrab = None
     HAS_PIL = False
 
-APP_VERSION = "1.7"
+APP_VERSION = "1.8"
 UPDATE_BASE = "https://raw.githubusercontent.com/gamingag1331-boop/drafting-table/main/"
 APP_FILE = os.path.abspath(__file__)
 BACKUP_DIR = os.path.join(os.path.dirname(APP_FILE), "backups")
@@ -261,6 +261,7 @@ class DraftingTable:
         r.bind("<Control-bracketleft>", lambda e: self.layer_move("backward"))
 
     def build_menus(self):
+        self.lock_var = tk.BooleanVar(self.root, value=True)
         self.board_menu = tk.Menu(self.root, tearoff=0)
         self.board_menu.add_command(label="Paste", accelerator="Ctrl+V",
                                     command=lambda: self.paste(self.right_spot))
@@ -284,6 +285,16 @@ class DraftingTable:
         self.item_menu.add_command(label="Send backward", accelerator="Ctrl+[",
                                    command=lambda: self.layer_move("backward"))
         self.item_menu.add_command(label="Send to back", command=lambda: self.layer_move("back"))
+        self.item_menu.add_separator()
+        pic = tk.Menu(self.item_menu, tearoff=0)
+        pic.add_command(label="Flip horizontal", command=lambda: self.picture_edit(self.flip_x))
+        pic.add_command(label="Flip vertical", command=lambda: self.picture_edit(self.flip_y))
+        pic.add_command(label="Rotate left 90 degrees", command=lambda: self.picture_edit(lambda it: self.turn(it, -90)))
+        pic.add_command(label="Rotate right 90 degrees", command=lambda: self.picture_edit(lambda it: self.turn(it, 90)))
+        pic.add_separator()
+        pic.add_checkbutton(label="Lock proportions", variable=self.lock_var, command=self.toggle_lock)
+        pic.add_command(label="Translucency...", command=self.open_translucency)
+        self.item_menu.add_cascade(label="Picture", menu=pic)
 
     def draw_grid(self):
         c = self.canvas
@@ -334,6 +345,7 @@ class DraftingTable:
         self.grid_color = grid_for(hexv)
         self.canvas.config(bg=hexv)
         self.draw_grid()
+        self.redraw()
         if mark:
             self.dirty = True
             self.flash(f"Board colour: {hexv}")
@@ -531,7 +543,7 @@ class DraftingTable:
                          "pre": pre, "moved": False}
 
     @staticmethod
-    def transform_item(orig, box0, box1):
+    def transform_item(orig, box0, box1, key=None):
         """New fields for an item when its box changes from box0 to box1."""
         x0, y0, x1, y1 = box0
         X0, Y0, X1, Y1 = box1
@@ -543,16 +555,25 @@ class DraftingTable:
         if t == "text":
             return {"x": X0, "w": max(MIN_SIZE * 4, X1 - X0)}
         if t == "image":
-            rot = orig.get("rot", 0) % 180
-            if rot == 0:
-                fw, fh = sx, sy
-            elif rot == 90:
-                fw, fh = sy, sx          # turned a quarter: the box axes swap
+            ccx, ccy = (X0 + X1) / 2, (Y0 + Y1) / 2
+            if orig.get("lock", True) and key and key[0] and key[1]:
+                # Corner drag with proportions locked: one factor, anchored at the opposite corner
+                s = sx if abs(sx - 1) >= abs(sy - 1) else sy
+                ax = x1 if key[0] < 0 else x0
+                ay = y1 if key[1] < 0 else y0
+                c0x, c0y = (x0 + x1) / 2, (y0 + y1) / 2
+                ccx, ccy = ax + (c0x - ax) * s, ay + (c0y - ay) * s
+                fw = fh = s
             else:
-                fw = fh = (sx + sy) / 2  # turned at an angle: scale evenly
+                rot = orig.get("rot", 0) % 180
+                if rot == 0:
+                    fw, fh = sx, sy
+                elif rot == 90:
+                    fw, fh = sy, sx          # turned a quarter: the box axes swap
+                else:
+                    fw = fh = (sx + sy) / 2  # turned at an angle: scale evenly
             nw = max(MIN_SIZE * 2, orig["w"] * fw)
             nh = max(MIN_SIZE * 2, orig["h"] * fh)
-            ccx, ccy = (X0 + X1) / 2, (Y0 + Y1) / 2
             return {"w": nw, "h": nh, "x": ccx - nw / 2, "y": ccy - nh / 2}
         return {}
 
@@ -601,12 +622,11 @@ class DraftingTable:
             W = max(1, round(it["w"] * Z))
             H = max(1, round(it["h"] * Z))
             rot = it.get("rot", 0) % 360
-            key = (W, H, rot)
+            alpha = it.get("alpha", 100)
+            flips = (bool(it.get("flipx")), bool(it.get("flipy")))
+            key = (W, H, rot, alpha, flips, self.board)
             if it.get("tkkey") != key:
-                img = it["pil"].resize((W, H), Image.LANCZOS)
-                if rot:
-                    img = img.rotate(-rot, resample=Image.BICUBIC, expand=True)  # clockwise turn
-                it["tk"] = ImageTk.PhotoImage(img)
+                it["tk"] = ImageTk.PhotoImage(self.render_picture(it, W, H, rot, alpha, flips))
                 it["tkkey"] = key
             cx = (it["x"] + it["w"] / 2) * Z
             cy = (it["y"] + it["h"] / 2) * Z
@@ -710,7 +730,7 @@ class DraftingTable:
                 ny1 = max(y, y0 + MIN_SIZE)
             it = self.by_id(d["id"])
             if it:
-                it.update(self.transform_item(d["orig"], d["box"], (nx0, ny0, nx1, ny1)))
+                it.update(self.transform_item(d["orig"], d["box"], (nx0, ny0, nx1, ny1), d["key"]))
             d["moved"] = True
         elif mode == "rotate":
             cx, cy = d["center"]
@@ -809,10 +829,93 @@ class DraftingTable:
             menu = self.item_menu
         else:
             menu = self.board_menu
+        first = next((i for i in self.items if i["id"] in self.sel and i["type"] == "image"), None)
+        self.lock_var.set(first.get("lock", True) if first else True)
         try:
             menu.tk_popup(e.x_root, e.y_root)
         finally:
             menu.grab_release()
+
+    # ---------- Pictures ----------
+    def picture_edit(self, fn):
+        targets = [it for it in self.items if it["id"] in self.sel and it["type"] == "image"]
+        if not targets:
+            self.flash("Select a picture first")
+            return
+        pre = self.snapshot()
+        for it in targets:
+            fn(it)
+        self.push_undo(pre)
+        self.redraw()
+
+    @staticmethod
+    def flip_x(it):
+        it["flipx"] = not it.get("flipx", False)
+
+    @staticmethod
+    def flip_y(it):
+        it["flipy"] = not it.get("flipy", False)
+
+    @staticmethod
+    def turn(it, deg):
+        it["rot"] = (it.get("rot", 0) + deg) % 360
+
+    def toggle_lock(self):
+        val = self.lock_var.get()
+        self.picture_edit(lambda it: it.__setitem__("lock", val))
+
+    def open_translucency(self):
+        targets = [it for it in self.items if it["id"] in self.sel and it["type"] == "image"]
+        if not targets:
+            self.flash("Select a picture first")
+            return
+        ids = [it["id"] for it in targets]
+        pre = self.snapshot()
+        before = {it["id"]: it.get("alpha", 100) for it in pre}
+        top = tk.Toplevel(self.root)
+        top.title("Translucency")
+        top.transient(self.root)
+
+        def live(v):
+            for i in ids:
+                it = self.by_id(i)
+                if it:
+                    it["alpha"] = int(float(v))
+            self.redraw()
+
+        scale = tk.Scale(top, from_=0, to=100, orient=tk.HORIZONTAL, length=260,
+                         label="Opacity (%)", command=live)
+        scale.set(targets[0].get("alpha", 100))
+        scale.pack(padx=16, pady=(12, 4))
+        tk.Label(top, text="0 = invisible, 100 = solid").pack()
+
+        def done():
+            changed = any(self.by_id(i) and self.by_id(i).get("alpha", 100) != before[i] for i in ids)
+            if changed:
+                self.push_undo(pre)
+                self.redraw()
+            top.destroy()
+
+        top.protocol("WM_DELETE_WINDOW", done)
+        tk.Button(top, text="Done", command=done).pack(pady=8)
+
+    def board_rgba(self):
+        h = self.board
+        return tuple(int(h[i:i + 2], 16) for i in (1, 3, 5)) + (255,)
+
+    def render_picture(self, it, W, H, rot, alpha, flips):
+        img = it["pil"]
+        if flips[0]:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+        if flips[1]:
+            img = img.transpose(Image.FLIP_TOP_BOTTOM)
+        img = img.resize((W, H), Image.LANCZOS)
+        if rot:
+            img = img.rotate(-rot, resample=Image.BICUBIC, expand=True)  # clockwise turn
+        if alpha < 100:
+            img.putalpha(img.getchannel("A").point(lambda v: v * alpha // 100))
+        # Blend over the board colour, so transparent areas and see-through pictures match the board
+        return Image.alpha_composite(Image.new("RGBA", img.size, self.board_rgba()), img)
 
     # ---------- Layers ----------
     def layer_move(self, how):
@@ -986,7 +1089,7 @@ class DraftingTable:
         h = pil.height * w / pil.width
         pre = self.snapshot()
         it = {"id": self.new_id(), "type": "image", "x": round(x - w / 2), "y": round(y - h / 2),
-              "w": w, "h": h, "rot": 0, "pil": pil, "pinned": False}
+              "w": w, "h": h, "rot": 0, "alpha": 100, "flipx": False, "flipy": False, "lock": True, "pil": pil, "pinned": False}
         self.items.append(it)
         self.sel = {it["id"]}
         self.push_undo(pre)
