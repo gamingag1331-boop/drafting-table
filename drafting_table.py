@@ -2,7 +2,8 @@
 """Drafting Table: a desktop drafting surface.
 
 Write notes, draw freehand, draw lines and arrows, highlight, and place images.
-Undo/redo, cut/copy/paste/duplicate, and save/open .drafting.json files.
+Free transform (stretch and turn), zoom, right-click menus, undo/redo,
+cut/copy/paste/duplicate, save/open .drafting.json files, and Check for updates.
 
 Needs Python 3 with tkinter (included with the python.org installers).
 Pillow is optional. It enables JPEG/WebP/PNG images and pasting images from the clipboard:
@@ -11,12 +12,13 @@ Pillow is optional. It enables JPEG/WebP/PNG images and pasting images from the 
 import base64
 import io
 import json
+import math
 import os
 import shutil
 import sys
+import time
 import tkinter as tk
 import urllib.request
-import time
 from tkinter import colorchooser, filedialog, messagebox, simpledialog
 
 try:
@@ -30,21 +32,29 @@ except Exception:
     Image = ImageTk = ImageGrab = None
     HAS_PIL = False
 
+APP_VERSION = "1.6"
+UPDATE_BASE = "https://raw.githubusercontent.com/gamingag1331-boop/drafting-table/main/"
+APP_FILE = os.path.abspath(__file__)
+BACKUP_DIR = os.path.join(os.path.dirname(APP_FILE), "backups")
+
 BOARD_W, BOARD_H = 3000, 2200
 GRID_STEP = 40
-PAPER = "#eef2f0"
-GRID = "#d3dbd8"
+ZOOM_MIN, ZOOM_MAX = 0.25, 4.0
+HANDLE = 8        # size of a transform handle, in screen pixels
+ROT_OFFSET = 28   # distance of the turn handle above the box, in screen pixels
+MIN_SIZE = 10     # smallest size a transform can make, in board units
 HIGHLIGHT = "#fff07a"
 ACCENT = "#2f5bd3"
 COLORS = [("Ink", "#1b2b30"), ("Red", "#c8402d"), ("Blue", "#2f5bd3"), ("Green", "#2f8f5b")]
 FILLS = [("None", None), ("Yellow", "#fff3a3"), ("Pink", "#ffd6c9"), ("Blue", "#cfe8ff"), ("Green", "#d5f5dc")]
-APP_VERSION = "1.5"
-UPDATE_BASE = "https://raw.githubusercontent.com/gamingag1331-boop/drafting-table/main/"
-APP_FILE = os.path.abspath(__file__)
-BACKUP_DIR = os.path.join(os.path.dirname(APP_FILE), "backups")
 BOARD_DEFAULT = "#eef2f0"
 OLD_BOARD_NAMES = {"Paper": "#eef2f0", "White": "#ffffff", "Kraft": "#efe3cc",
                    "Sage": "#e1ebe1", "Sky": "#e3eef8"}
+FONT_SIZE = 16
+STROKE_TYPES = ("stroke", "highlight")
+LINE_TYPES = ("line", "arrow")
+TOOL_TO_TYPE = {"pen": "stroke", "highlight": "highlight", "line": "line", "arrow": "arrow"}
+TOOL_WIDTH = {"stroke": 3, "highlight": 22, "line": 2.5, "arrow": 2.5}
 
 
 def grid_for(hexv):
@@ -62,11 +72,6 @@ def load_board(value):
         except ValueError:
             pass
     return OLD_BOARD_NAMES.get(value, BOARD_DEFAULT)
-FONT = ("Georgia", 16)
-STROKE_TYPES = ("stroke", "highlight")
-LINE_TYPES = ("line", "arrow")
-TOOL_TO_TYPE = {"pen": "stroke", "highlight": "highlight", "line": "line", "arrow": "arrow"}
-TOOL_WIDTH = {"stroke": 3, "highlight": 22, "line": 2.5, "arrow": 2.5}
 
 
 def fetch_update_file(name):
@@ -94,6 +99,34 @@ def dist_seg(p, a, b):
     return ((px - qx) ** 2 + (py - qy) ** 2) ** 0.5
 
 
+def rotate_pts(pts, center, deg):
+    """Turn points clockwise (screen coordinates) around center by deg degrees."""
+    cx, cy = center
+    t = math.radians(deg)
+    c, s = math.cos(t), math.sin(t)
+    return [(cx + (px - cx) * c - (py - cy) * s, cy + (px - cx) * s + (py - cy) * c) for px, py in pts]
+
+
+def rotated_corners(x, y, w, h, deg):
+    cx, cy = x + w / 2, y + h / 2
+    t = math.radians(deg)
+    c, s = math.cos(t), math.sin(t)
+    out = []
+    for dx, dy in ((-w / 2, -h / 2), (w / 2, -h / 2), (w / 2, h / 2), (-w / 2, h / 2)):
+        out.append((cx + dx * c - dy * s, cy + dx * s + dy * c))
+    return out
+
+
+def text_line_count(it):
+    """How many lines a note takes, counting wrapping when the note has a set width."""
+    lines = it["text"].split("\n")
+    w = it.get("w")
+    if w:
+        cpl = max(1, int(w / 9))
+        return sum(max(1, -(-len(line) // cpl)) for line in lines)
+    return len(lines)
+
+
 class DraftingTable:
     def __init__(self, root):
         self.root = root
@@ -107,8 +140,10 @@ class DraftingTable:
         self.tool = "select"
         self.color = COLORS[0][1]
         self.fill = None
+        self.zoom = 1.0
         self.right_spot = (80, 80)
         self.board = BOARD_DEFAULT
+        self.grid_color = grid_for(BOARD_DEFAULT)
         self.drag = None
         self.path = None
         self.dirty = False
@@ -118,7 +153,6 @@ class DraftingTable:
         self.build_ui()
         self.bind_keys()
         self.build_menus()
-        self.draw_grid()
         self.items.append({"id": self.new_id(), "type": "text", "x": 80, "y": 60,
                            "text": "Drafting table.\nPick a tool, or paste an image with Ctrl+V.",
                            "color": COLORS[0][1], "pinned": False})
@@ -154,8 +188,7 @@ class DraftingTable:
         tk.Label(bar, text="Note fill:").pack(side=tk.LEFT)
         self.fill_buttons = {}
         for fname, fhex in FILLS:
-            b = tk.Button(bar, text=fname, bg=fhex or "#ffffff", width=7,
-                          command=lambda c=fhex: self.set_fill(c))
+            b = tk.Button(bar, text=fname, bg=fhex or "#ffffff", width=7, command=lambda c=fhex: self.set_fill(c))
             b.pack(side=tk.LEFT, padx=2)
             self.fill_buttons[fhex] = b
         tk.Frame(bar, width=14).pack(side=tk.LEFT)
@@ -166,7 +199,6 @@ class DraftingTable:
         actions = [("Undo", self.undo), ("Redo", self.redo), ("Cut", self.cut), ("Copy", self.copy),
                    ("Paste", self.paste), ("Duplicate", self.duplicate), ("Delete", self.delete_selected),
                    ("Pin / Unpin", self.toggle_pin), ("Add image", self.add_image_dialog),
-                   ("Bigger", lambda: self.scale_selected(1.1)), ("Smaller", lambda: self.scale_selected(0.9)),
                    ("Open", self.open_file), ("Save", self.save), ("Clear", self.clear_board),
                    ("Check for updates", self.check_updates)]
         for text, cmd in actions:
@@ -174,7 +206,7 @@ class DraftingTable:
 
         frame = tk.Frame(self.root)
         frame.pack(fill=tk.BOTH, expand=True)
-        self.canvas = tk.Canvas(frame, bg=PAPER, highlightthickness=0,
+        self.canvas = tk.Canvas(frame, bg=BOARD_DEFAULT, highlightthickness=0,
                                 scrollregion=(0, 0, BOARD_W, BOARD_H))
         vs = tk.Scrollbar(frame, orient=tk.VERTICAL, command=self.canvas.yview)
         hs = tk.Scrollbar(frame, orient=tk.HORIZONTAL, command=self.canvas.xview)
@@ -185,17 +217,26 @@ class DraftingTable:
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
 
-        self.status = tk.Label(self.root, anchor="w", padx=8, pady=4)
-        self.status.pack(side=tk.BOTTOM, fill=tk.X)
+        bottom = tk.Frame(self.root)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
+        zoomf = tk.Frame(bottom, padx=8)
+        zoomf.pack(side=tk.RIGHT)
+        tk.Button(zoomf, text="Zoom out", command=self.zoom_out).pack(side=tk.LEFT, padx=2)
+        self.zoom_label = tk.Label(zoomf, width=6, text="100%")
+        self.zoom_label.pack(side=tk.LEFT)
+        tk.Button(zoomf, text="Zoom in", command=self.zoom_in).pack(side=tk.LEFT, padx=2)
+        tk.Button(zoomf, text="100%", command=self.zoom_reset).pack(side=tk.LEFT, padx=2)
+        self.status = tk.Label(bottom, anchor="w", padx=8, pady=4)
+        self.status.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         c = self.canvas
         c.bind("<ButtonPress-1>", self.on_press)
         c.bind("<B1-Motion>", self.on_drag)
         c.bind("<ButtonRelease-1>", self.on_release)
         c.bind("<Double-Button-1>", self.on_double)
-        c.bind("<MouseWheel>", lambda e: c.yview_scroll(-3 if e.delta > 0 else 3, "units"))
-        c.bind("<Button-4>", lambda e: c.yview_scroll(-3, "units"))
-        c.bind("<Button-5>", lambda e: c.yview_scroll(3, "units"))
+        c.bind("<MouseWheel>", self.on_wheel)
+        c.bind("<Button-4>", lambda e: self.on_wheel(e, 1))
+        c.bind("<Button-5>", lambda e: self.on_wheel(e, -1))
         # Right-click: Mac uses Button-2 in Tk, Windows and Linux use Button-3
         c.bind("<Button-2>" if sys.platform == "darwin" else "<Button-3>", self.on_right_click)
 
@@ -212,16 +253,41 @@ class DraftingTable:
         r.bind("<Delete>", lambda e: self.delete_selected())
         r.bind("<BackSpace>", lambda e: self.delete_selected())
         r.bind("<Escape>", lambda e: (self.set_tool("select"), self.select_none()))
-        for key in ("<plus>", "<equal>"):
-            r.bind(key, lambda e: self.scale_selected(1.1))
-        r.bind("<minus>", lambda e: self.scale_selected(0.9))
+        r.bind("<Control-equal>", lambda e: self.zoom_in())
+        r.bind("<Control-plus>", lambda e: self.zoom_in())
+        r.bind("<Control-minus>", lambda e: self.zoom_out())
+        r.bind("<Control-0>", lambda e: self.zoom_reset())
+
+    def build_menus(self):
+        self.board_menu = tk.Menu(self.root, tearoff=0)
+        self.board_menu.add_command(label="Paste", accelerator="Ctrl+V",
+                                    command=lambda: self.paste(self.right_spot))
+        self.board_menu.add_command(label="Add note here", command=lambda: self.new_note(*self.right_spot))
+        self.board_menu.add_command(label="Add image...", command=self.add_image_dialog)
+        self.board_menu.add_separator()
+        self.board_menu.add_command(label="Select all", accelerator="Ctrl+A", command=self.select_all)
+
+        self.item_menu = tk.Menu(self.root, tearoff=0)
+        self.item_menu.add_command(label="Copy", accelerator="Ctrl+C", command=self.copy)
+        self.item_menu.add_command(label="Cut", accelerator="Ctrl+X", command=self.cut)
+        self.item_menu.add_command(label="Duplicate", accelerator="Ctrl+D", command=self.duplicate)
+        self.item_menu.add_command(label="Delete", accelerator="Delete", command=self.delete_selected)
+        self.item_menu.add_separator()
+        self.item_menu.add_command(label="Pin / Unpin", accelerator="Ctrl+K", command=self.toggle_pin)
+        self.item_menu.add_command(label="Edit text...", command=self.edit_selected_text)
 
     def draw_grid(self):
         c = self.canvas
-        for x in range(0, BOARD_W + 1, GRID_STEP):
-            c.create_line(x, 0, x, BOARD_H, fill=GRID, tags="grid")
-        for y in range(0, BOARD_H + 1, GRID_STEP):
-            c.create_line(0, y, BOARD_W, y, fill=GRID, tags="grid")
+        c.delete("grid")
+        step = GRID_STEP * self.zoom
+        w, h = BOARD_W * self.zoom, BOARD_H * self.zoom
+        for i in range(BOARD_W // GRID_STEP + 1):
+            x = i * step
+            c.create_line(x, 0, x, h, fill=self.grid_color, tags="grid")
+        for j in range(BOARD_H // GRID_STEP + 1):
+            y = j * step
+            c.create_line(0, y, w, y, fill=self.grid_color, tags="grid")
+        c.tag_lower("grid")
 
     def set_tool(self, name):
         self.tool = name
@@ -242,20 +308,6 @@ class DraftingTable:
             self.push_undo(pre)
         self.redraw()
 
-    def set_board(self, hexv, mark=True):
-        self.board = hexv
-        self.canvas.config(bg=hexv)
-        self.canvas.itemconfig("grid", fill=grid_for(hexv))
-        if mark:
-            self.dirty = True
-            self.flash(f"Board colour: {hexv}")
-        self.update_status()
-
-    def pick_board(self):
-        _rgb, hexv = colorchooser.askcolor(initialcolor=self.board, title="Board colour", parent=self.root)
-        if hexv:
-            self.set_board(hexv.lower())
-
     def set_fill(self, hexv):
         self.fill = hexv
         for h, b in self.fill_buttons.items():
@@ -268,6 +320,21 @@ class DraftingTable:
             self.push_undo(pre)
         self.redraw()
 
+    def set_board(self, hexv, mark=True):
+        self.board = hexv
+        self.grid_color = grid_for(hexv)
+        self.canvas.config(bg=hexv)
+        self.draw_grid()
+        if mark:
+            self.dirty = True
+            self.flash(f"Board colour: {hexv}")
+        self.update_status()
+
+    def pick_board(self):
+        _rgb, hexv = colorchooser.askcolor(initialcolor=self.board, title="Board colour", parent=self.root)
+        if hexv:
+            self.set_board(hexv.lower())
+
     def flash(self, msg):
         self.status_msg = msg
         self.update_status()
@@ -278,6 +345,42 @@ class DraftingTable:
         if self.status_msg:
             text += f"   |   {self.status_msg}"
         self.status.config(text=text)
+        if hasattr(self, "zoom_label"):
+            self.zoom_label.config(text=f"{round(self.zoom * 100)}%")
+
+    # ---------- Zoom ----------
+    def set_zoom(self, z, anchor=None):
+        z = max(ZOOM_MIN, min(ZOOM_MAX, z))
+        if abs(z - self.zoom) < 1e-9:
+            return
+        c = self.canvas
+        ax, ay = anchor if anchor else (c.winfo_width() / 2, c.winfo_height() / 2)
+        bx = c.canvasx(ax) / self.zoom
+        by = c.canvasy(ay) / self.zoom
+        self.zoom = z
+        c.config(scrollregion=(0, 0, BOARD_W * z, BOARD_H * z))
+        self.draw_grid()
+        self.redraw()
+        # Keep the board point under the pointer (or the centre) where it was
+        c.xview_moveto(max(0.0, bx * z - ax) / (BOARD_W * z))
+        c.yview_moveto(max(0.0, by * z - ay) / (BOARD_H * z))
+
+    def zoom_in(self):
+        self.set_zoom(self.zoom * 1.25)
+
+    def zoom_out(self):
+        self.set_zoom(self.zoom / 1.25)
+
+    def zoom_reset(self):
+        self.set_zoom(1.0)
+
+    def on_wheel(self, e, sign=None):
+        if sign is None:
+            sign = 1 if e.delta > 0 else -1
+        if e.state & 0x0004:  # Ctrl is held: zoom around the pointer
+            self.set_zoom(self.zoom * (1.15 if sign > 0 else 1 / 1.15), anchor=(e.x, e.y))
+        else:
+            self.canvas.yview_scroll(-3 * sign, "units")
 
     # ---------- Model helpers ----------
     def new_id(self):
@@ -289,6 +392,11 @@ class DraftingTable:
         for it in self.items:
             if it["id"] == iid:
                 return it
+        return None
+
+    def single_selected(self):
+        if len(self.sel) == 1:
+            return self.by_id(next(iter(self.sel)))
         return None
 
     @staticmethod
@@ -325,12 +433,20 @@ class DraftingTable:
             ys = [p[1] for p in it["pts"]]
             return (min(xs), min(ys), max(xs), max(ys))
         if t == "text":
-            lines = it["text"].split("\n")
-            w = max(len(line) for line in lines) * 9
-            h = len(lines) * 24
-            return (it["x"], it["y"], it["x"] + max(w, 24), it["y"] + max(h, 24))
+            if it.get("w"):
+                width = it["w"]
+            else:
+                width = max(len(line) for line in it["text"].split("\n")) * 9
+            h = text_line_count(it) * 24
+            return (it["x"], it["y"], it["x"] + max(width, 24), it["y"] + max(h, 24))
         if t == "image":
-            return (it["x"], it["y"], it["x"] + it["w"], it["y"] + it["h"])
+            rot = it.get("rot", 0) % 360
+            if rot == 0:
+                return (it["x"], it["y"], it["x"] + it["w"], it["y"] + it["h"])
+            pts = rotated_corners(it["x"], it["y"], it["w"], it["h"], rot)
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            return (min(xs), min(ys), max(xs), max(ys))
         return None
 
     def near(self, it, x, y):
@@ -350,52 +466,151 @@ class DraftingTable:
                 return it
         return None
 
+    # ---------- Free transform ----------
+    def handle_spots(self, it):
+        """Handle positions in board units. Corners and edges stretch; 'rot' turns."""
+        b = self.bounds(it)
+        if not b:
+            return {}
+        x0, y0, x1, y1 = b
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        is_text = it["type"] == "text"
+        spots = {}
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                if is_text and dy != 0:
+                    continue  # notes only stretch sideways; their height follows the text
+                px = x0 if dx < 0 else (x1 if dx > 0 else cx)
+                py = y0 if dy < 0 else (y1 if dy > 0 else cy)
+                spots[(dx, dy)] = (px, py)
+        if not is_text:
+            spots["rot"] = (cx, y0 - ROT_OFFSET / self.zoom)
+        return spots
+
+    def draw_handles(self, it):
+        c = self.canvas
+        Z = self.zoom
+        b = self.bounds(it)
+        spots = self.handle_spots(it)
+        if not b or not spots:
+            return
+        if "rot" in spots:
+            rx, ry = spots["rot"]
+            c.create_line((b[0] + b[2]) / 2 * Z, b[1] * Z, rx * Z, ry * Z, fill=ACCENT, tags="item")
+        for key, (px, py) in spots.items():
+            if key == "rot":
+                r = 6
+                c.create_oval(px * Z - r, py * Z - r, px * Z + r, py * Z + r,
+                              fill="#ffffff", outline=ACCENT, width=2, tags="item")
+            else:
+                h = HANDLE / 2
+                c.create_rectangle(px * Z - h, py * Z - h, px * Z + h, py * Z + h,
+                                   fill="#ffffff", outline=ACCENT, width=1.5, tags="item")
+
+    def start_transform(self, it, key, x, y):
+        b = self.bounds(it)
+        pre = self.snapshot()
+        orig = self.clone(it)
+        if key == "rot":
+            cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+            self.drag = {"mode": "rotate", "id": it["id"], "orig": orig, "center": (cx, cy),
+                         "ang0": math.degrees(math.atan2(y - cy, x - cx)), "pre": pre, "moved": False}
+        else:
+            self.drag = {"mode": "resize", "id": it["id"], "orig": orig, "box": b, "key": key,
+                         "pre": pre, "moved": False}
+
+    @staticmethod
+    def transform_item(orig, box0, box1):
+        """New fields for an item when its box changes from box0 to box1."""
+        x0, y0, x1, y1 = box0
+        X0, Y0, X1, Y1 = box1
+        sx = (X1 - X0) / max(1e-6, x1 - x0)
+        sy = (Y1 - Y0) / max(1e-6, y1 - y0)
+        t = orig["type"]
+        if t in STROKE_TYPES + LINE_TYPES:
+            return {"pts": [(X0 + (px - x0) * sx, Y0 + (py - y0) * sy) for px, py in orig["pts"]]}
+        if t == "text":
+            return {"x": X0, "w": max(MIN_SIZE * 4, X1 - X0)}
+        if t == "image":
+            rot = orig.get("rot", 0) % 180
+            if rot == 0:
+                fw, fh = sx, sy
+            elif rot == 90:
+                fw, fh = sy, sx          # turned a quarter: the box axes swap
+            else:
+                fw = fh = (sx + sy) / 2  # turned at an angle: scale evenly
+            nw = max(MIN_SIZE * 2, orig["w"] * fw)
+            nh = max(MIN_SIZE * 2, orig["h"] * fh)
+            ccx, ccy = (X0 + X1) / 2, (Y0 + Y1) / 2
+            return {"w": nw, "h": nh, "x": ccx - nw / 2, "y": ccy - nh / 2}
+        return {}
+
     # ---------- Drawing ----------
     def draw_item(self, it):
         c = self.canvas
+        Z = self.zoom
         tag = ("item", f"i{it['id']}")
         t = it["type"]
         if t in STROKE_TYPES + LINE_TYPES:
             if len(it["pts"]) < 2:
                 return
-            flat = [v for p in it["pts"] for v in p]
+            flat = []
+            for px, py in it["pts"]:
+                flat += [px * Z, py * Z]
+            width = max(1, it["width"] * Z)
             if t == "highlight":
-                c.create_line(*flat, fill=HIGHLIGHT, width=it["width"], capstyle=tk.ROUND,
+                c.create_line(*flat, fill=HIGHLIGHT, width=width, capstyle=tk.ROUND,
                               joinstyle=tk.ROUND, tags=tag)
             elif t == "stroke":
-                c.create_line(*flat, fill=it["color"], width=it["width"], capstyle=tk.ROUND,
+                c.create_line(*flat, fill=it["color"], width=width, capstyle=tk.ROUND,
                               joinstyle=tk.ROUND, smooth=len(it["pts"]) > 2, tags=tag)
             elif t == "line":
-                c.create_line(*flat, fill=it["color"], width=it["width"], capstyle=tk.ROUND, tags=tag)
+                c.create_line(*flat, fill=it["color"], width=width, capstyle=tk.ROUND, tags=tag)
             elif t == "arrow":
-                c.create_line(*flat, fill=it["color"], width=it["width"], capstyle=tk.ROUND,
-                              arrow=tk.LAST, arrowshape=(14, 18, 6), tags=tag)
+                c.create_line(*flat, fill=it["color"], width=width, capstyle=tk.ROUND,
+                              arrow=tk.LAST, arrowshape=(14 * Z, 18 * Z, 6 * Z), tags=tag)
         elif t == "text":
+            kw = {"text": it["text"], "anchor": "nw", "font": ("Georgia", max(6, round(FONT_SIZE * Z))),
+                  "fill": it["color"], "tags": tag}
+            if it.get("w"):
+                kw["width"] = it["w"] * Z
+            elif it.get("bg"):
+                kw["width"] = 240 * Z
+            x, y = it["x"] * Z, it["y"] * Z
             if it.get("bg"):
-                tid = c.create_text(it["x"], it["y"], text=it["text"], anchor="nw", font=FONT,
-                                    fill=it["color"], width=240, tags=tag)
+                tid = c.create_text(x, y, **kw)
                 bb = c.bbox(tid)
                 if bb:
-                    rect = c.create_rectangle(bb[0] - 10, bb[1] - 8, bb[2] + 10, bb[3] + 8,
+                    rect = c.create_rectangle(bb[0] - 10 * Z, bb[1] - 8 * Z, bb[2] + 10 * Z, bb[3] + 8 * Z,
                                               fill=it["bg"], outline="", tags=tag)
                     c.tag_lower(rect, tid)
             else:
-                c.create_text(it["x"], it["y"], text=it["text"], anchor="nw", font=FONT,
-                              fill=it["color"], tags=tag)
+                c.create_text(x, y, **kw)
         elif t == "image":
-            if it.get("tk") is None or it.get("tkw") != it["w"]:
-                w = max(1, int(round(it["w"])))
-                h = max(1, int(round(it["h"])))
-                it["tk"] = ImageTk.PhotoImage(it["pil"].resize((w, h), Image.LANCZOS))
-                it["tkw"] = it["w"]
-            c.create_image(it["x"], it["y"], image=it["tk"], anchor="nw", tags=tag)
+            W = max(1, round(it["w"] * Z))
+            H = max(1, round(it["h"] * Z))
+            rot = it.get("rot", 0) % 360
+            key = (W, H, rot)
+            if it.get("tkkey") != key:
+                img = it["pil"].resize((W, H), Image.LANCZOS)
+                if rot:
+                    img = img.rotate(-rot, resample=Image.BICUBIC, expand=True)  # clockwise turn
+                it["tk"] = ImageTk.PhotoImage(img)
+                it["tkkey"] = key
+            cx = (it["x"] + it["w"] / 2) * Z
+            cy = (it["y"] + it["h"] / 2) * Z
+            c.create_image(cx, cy, image=it["tk"], anchor="center", tags=tag)
         if it.get("pinned"):
             b = self.bounds(it)
             if b:
-                c.create_oval(b[0] - 7, b[1] - 7, b[0] + 3, b[1] + 3, fill=ACCENT, outline="", tags=tag)
+                c.create_oval(b[0] * Z - 7, b[1] * Z - 7, b[0] * Z + 3, b[1] * Z + 3,
+                              fill=ACCENT, outline="", tags=tag)
 
     def redraw(self):
         c = self.canvas
+        Z = self.zoom
         c.delete("item")
         for it in sorted(self.items, key=lambda i: 0 if i["type"] == "highlight" else 1):
             self.draw_item(it)
@@ -403,23 +618,27 @@ class DraftingTable:
             if it["id"] in self.sel:
                 b = self.bounds(it)
                 if b:
-                    c.create_rectangle(b[0] - 6, b[1] - 6, b[2] + 6, b[3] + 6, outline=ACCENT,
-                                       dash=(4, 3), width=1.5, tags="item")
+                    c.create_rectangle(b[0] * Z - 6, b[1] * Z - 6, b[2] * Z + 6, b[3] * Z + 6,
+                                       outline=ACCENT, dash=(4, 3), width=1.5, tags="item")
+        one = self.single_selected()
+        if one:
+            self.draw_handles(one)
         d = self.drag
         if d and d["mode"] == "draw":
             t = TOOL_TO_TYPE[d["tool"]]
             self.draw_item({"id": 0, "type": t, "pts": d["pts"], "width": TOOL_WIDTH[t],
                             "color": self.color})
         elif d and d["mode"] == "marquee":
-            c.create_rectangle(d["x0"], d["y0"], d["x1"], d["y1"], outline=ACCENT, dash=(3, 3), tags="item")
+            c.create_rectangle(d["x0"] * Z, d["y0"] * Z, d["x1"] * Z, d["y1"] * Z,
+                               outline=ACCENT, dash=(3, 3), tags="item")
         self.update_status()
 
     # ---------- Mouse ----------
     def cx(self, e):
-        return self.canvas.canvasx(e.x)
+        return self.canvas.canvasx(e.x) / self.zoom
 
     def cy(self, e):
-        return self.canvas.canvasy(e.y)
+        return self.canvas.canvasy(e.y) / self.zoom
 
     def on_press(self, e):
         self.canvas.focus_set()
@@ -429,6 +648,14 @@ class DraftingTable:
             self.new_note(x, y)
             return
         if self.tool == "select":
+            one = self.single_selected()
+            if one:
+                ex, ey = self.canvas.canvasx(e.x), self.canvas.canvasy(e.y)
+                for key, (px, py) in self.handle_spots(one).items():
+                    if abs(ex - px * self.zoom) <= HANDLE and abs(ey - py * self.zoom) <= HANDLE:
+                        self.start_transform(one, key, x, y)
+                        self.redraw()
+                        return
             hit = self.hit(x, y)
             if hit:
                 if shift:
@@ -451,7 +678,8 @@ class DraftingTable:
         if not d:
             return
         x, y = self.cx(e), self.cy(e)
-        if d["mode"] == "move":
+        mode = d["mode"]
+        if mode == "move":
             dx, dy = x - d["x0"], y - d["y0"]
             if dx or dy:
                 for it in self.items:
@@ -459,9 +687,36 @@ class DraftingTable:
                         self.move_item(it, dx, dy)
                 d["x0"], d["y0"] = x, y
                 d["moved"] = True
-        elif d["mode"] == "marquee":
+        elif mode == "resize":
+            x0, y0, x1, y1 = d["box"]
+            kx, ky = d["key"]
+            nx0, ny0, nx1, ny1 = x0, y0, x1, y1
+            if kx < 0:
+                nx0 = min(x, x1 - MIN_SIZE)
+            elif kx > 0:
+                nx1 = max(x, x0 + MIN_SIZE)
+            if ky < 0:
+                ny0 = min(y, y1 - MIN_SIZE)
+            elif ky > 0:
+                ny1 = max(y, y0 + MIN_SIZE)
+            it = self.by_id(d["id"])
+            if it:
+                it.update(self.transform_item(d["orig"], d["box"], (nx0, ny0, nx1, ny1)))
+            d["moved"] = True
+        elif mode == "rotate":
+            cx, cy = d["center"]
+            delta = math.degrees(math.atan2(y - cy, x - cx)) - d["ang0"]
+            it = self.by_id(d["id"])
+            orig = d["orig"]
+            if it:
+                if orig["type"] == "image":
+                    it["rot"] = (orig.get("rot", 0) + delta) % 360
+                elif orig["type"] in STROKE_TYPES + LINE_TYPES:
+                    it["pts"] = rotate_pts(orig["pts"], d["center"], delta)
+            d["moved"] = True
+        elif mode == "marquee":
             d["x1"], d["y1"] = x, y
-        elif d["mode"] == "draw":
+        elif mode == "draw":
             if d["tool"] in ("pen", "highlight"):
                 d["pts"].append((x, y))
             else:
@@ -473,7 +728,7 @@ class DraftingTable:
         self.drag = None
         if not d:
             return
-        if d["mode"] == "move":
+        if d["mode"] in ("move", "resize", "rotate"):
             if d["moved"]:
                 self.push_undo(d["pre"])
         elif d["mode"] == "marquee":
@@ -504,12 +759,22 @@ class DraftingTable:
             return
         it = self.hit(self.cx(e), self.cy(e))
         if it and it["type"] == "text":
-            new = simpledialog.askstring("Edit note", "Text:", initialvalue=it["text"], parent=self.root)
-            if new is not None and new != it["text"]:
-                pre = self.snapshot()
-                it["text"] = new
-                self.push_undo(pre)
-                self.redraw()
+            self.edit_text(it)
+
+    def edit_text(self, it):
+        new = simpledialog.askstring("Edit note", "Text:", initialvalue=it["text"], parent=self.root)
+        if new is not None and new != it["text"]:
+            pre = self.snapshot()
+            it["text"] = new
+            self.push_undo(pre)
+            self.redraw()
+
+    def edit_selected_text(self):
+        it = next((i for i in self.items if i["id"] in self.sel and i["type"] == "text"), None)
+        if not it:
+            self.flash("Select a note to edit its text")
+            return
+        self.edit_text(it)
 
     def new_note(self, x, y):
         text = simpledialog.askstring("New note", "Text:", parent=self.root)
@@ -523,6 +788,22 @@ class DraftingTable:
         self.sel = {it["id"]}
         self.push_undo(pre)
         self.redraw()
+
+    def on_right_click(self, e):
+        x, y = self.cx(e), self.cy(e)
+        self.right_spot = (x, y)
+        hit = self.hit(x, y)
+        if hit:
+            if hit["id"] not in self.sel:
+                self.sel = {hit["id"]}
+                self.redraw()
+            menu = self.item_menu
+        else:
+            menu = self.board_menu
+        try:
+            menu.tk_popup(e.x_root, e.y_root)
+        finally:
+            menu.grab_release()
 
     # ---------- Selection actions ----------
     def select_all(self):
@@ -556,17 +837,6 @@ class DraftingTable:
         ids = {it["id"] for it in removable}
         self.items = [it for it in self.items if it["id"] not in ids]
         self.sel = set()
-        self.push_undo(pre)
-        self.redraw()
-
-    def scale_selected(self, f):
-        imgs = [it for it in self.items if it["id"] in self.sel and it["type"] == "image"]
-        if not imgs:
-            return
-        pre = self.snapshot()
-        for it in imgs:
-            it["w"] = max(40, round(it["w"] * f))
-            it["h"] = it["pil"].height * it["w"] / it["pil"].width
         self.push_undo(pre)
         self.redraw()
 
@@ -607,7 +877,7 @@ class DraftingTable:
 
     def view_center(self):
         c = self.canvas
-        return c.canvasx(c.winfo_width() / 2), c.canvasy(c.winfo_height() / 2)
+        return c.canvasx(c.winfo_width() / 2) / self.zoom, c.canvasy(c.winfo_height() / 2) / self.zoom
 
     def paste(self, at=None):
         spot = at or self.view_center()
@@ -653,7 +923,7 @@ class DraftingTable:
             x, y = spot
             pre = self.snapshot()
             it = {"id": self.new_id(), "type": "text", "x": round(x), "y": round(y), "text": text.strip(),
-                  "color": self.color, "pinned": False}
+                  "color": self.color, "bg": self.fill, "pinned": False}
             self.items.append(it)
             self.sel = {it["id"]}
             self.push_undo(pre)
@@ -681,7 +951,7 @@ class DraftingTable:
         h = pil.height * w / pil.width
         pre = self.snapshot()
         it = {"id": self.new_id(), "type": "image", "x": round(x - w / 2), "y": round(y - h / 2),
-              "w": w, "h": h, "pil": pil, "pinned": False}
+              "w": w, "h": h, "rot": 0, "pil": pil, "pinned": False}
         self.items.append(it)
         self.sel = {it["id"]}
         self.push_undo(pre)
@@ -701,7 +971,7 @@ class DraftingTable:
 
     # ---------- Save / open ----------
     def serialize(self, it):
-        d = {k: v for k, v in it.items() if k not in ("tk", "tkw", "pil")}
+        d = {k: v for k, v in it.items() if k not in ("tk", "tkkey", "tkw", "pil")}
         if "pts" in d:
             d["pts"] = [list(p) for p in d["pts"]]
         if it["type"] == "image":
@@ -719,6 +989,7 @@ class DraftingTable:
                 raise RuntimeError("Pillow is needed to open this file (it contains images).")
             raw = base64.b64decode(it.pop("png"))
             it["pil"] = Image.open(io.BytesIO(raw)).convert("RGBA")
+            it.setdefault("rot", 0)
         return it
 
     def save(self, ask=False):
@@ -779,56 +1050,6 @@ class DraftingTable:
         if self.dirty and not self.confirm_discard():
             return
         self.root.destroy()
-
-    # ---------- Right-click menus ----------
-    def build_menus(self):
-        self.board_menu = tk.Menu(self.root, tearoff=0)
-        self.board_menu.add_command(label="Paste", accelerator="Ctrl+V",
-                                    command=lambda: self.paste(self.right_spot))
-        self.board_menu.add_command(label="Add note here", command=lambda: self.new_note(*self.right_spot))
-        self.board_menu.add_command(label="Add image...", command=self.add_image_dialog)
-        self.board_menu.add_separator()
-        self.board_menu.add_command(label="Select all", accelerator="Ctrl+A", command=self.select_all)
-
-        self.item_menu = tk.Menu(self.root, tearoff=0)
-        self.item_menu.add_command(label="Copy", accelerator="Ctrl+C", command=self.copy)
-        self.item_menu.add_command(label="Cut", accelerator="Ctrl+X", command=self.cut)
-        self.item_menu.add_command(label="Duplicate", accelerator="Ctrl+D", command=self.duplicate)
-        self.item_menu.add_command(label="Delete", accelerator="Delete", command=self.delete_selected)
-        self.item_menu.add_separator()
-        self.item_menu.add_command(label="Pin / Unpin", accelerator="Ctrl+K", command=self.toggle_pin)
-        self.item_menu.add_command(label="Edit text...", command=self.edit_selected_text)
-        self.item_menu.add_separator()
-        self.item_menu.add_command(label="Bigger", command=lambda: self.scale_selected(1.1))
-        self.item_menu.add_command(label="Smaller", command=lambda: self.scale_selected(0.9))
-
-    def on_right_click(self, e):
-        x, y = self.cx(e), self.cy(e)
-        self.right_spot = (x, y)
-        hit = self.hit(x, y)
-        if hit:
-            if hit["id"] not in self.sel:
-                self.sel = {hit["id"]}
-                self.redraw()
-            menu = self.item_menu
-        else:
-            menu = self.board_menu
-        try:
-            menu.tk_popup(e.x_root, e.y_root)
-        finally:
-            menu.grab_release()
-
-    def edit_selected_text(self):
-        it = next((i for i in self.items if i["id"] in self.sel and i["type"] == "text"), None)
-        if not it:
-            self.flash("Select a note to edit its text")
-            return
-        new = simpledialog.askstring("Edit note", "Text:", initialvalue=it["text"], parent=self.root)
-        if new is not None and new != it["text"]:
-            pre = self.snapshot()
-            it["text"] = new
-            self.push_undo(pre)
-            self.redraw()
 
     # ---------- Updates ----------
     def check_updates(self):
