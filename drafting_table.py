@@ -13,6 +13,7 @@ import io
 import json
 import os
 import shutil
+import sys
 import tkinter as tk
 import urllib.request
 import time
@@ -37,7 +38,7 @@ HIGHLIGHT = "#fff07a"
 ACCENT = "#2f5bd3"
 COLORS = [("Ink", "#1b2b30"), ("Red", "#c8402d"), ("Blue", "#2f5bd3"), ("Green", "#2f8f5b")]
 FILLS = [("None", None), ("Yellow", "#fff3a3"), ("Pink", "#ffd6c9"), ("Blue", "#cfe8ff"), ("Green", "#d5f5dc")]
-APP_VERSION = "1.4"
+APP_VERSION = "1.5"
 UPDATE_BASE = "https://raw.githubusercontent.com/gamingag1331-boop/drafting-table/main/"
 APP_FILE = os.path.abspath(__file__)
 BACKUP_DIR = os.path.join(os.path.dirname(APP_FILE), "backups")
@@ -106,6 +107,7 @@ class DraftingTable:
         self.tool = "select"
         self.color = COLORS[0][1]
         self.fill = None
+        self.right_spot = (80, 80)
         self.board = BOARD_DEFAULT
         self.drag = None
         self.path = None
@@ -115,6 +117,7 @@ class DraftingTable:
             self.status_msg = "Pillow not installed: images are disabled. Run: pip install pillow"
         self.build_ui()
         self.bind_keys()
+        self.build_menus()
         self.draw_grid()
         self.items.append({"id": self.new_id(), "type": "text", "x": 80, "y": 60,
                            "text": "Drafting table.\nPick a tool, or paste an image with Ctrl+V.",
@@ -193,6 +196,8 @@ class DraftingTable:
         c.bind("<MouseWheel>", lambda e: c.yview_scroll(-3 if e.delta > 0 else 3, "units"))
         c.bind("<Button-4>", lambda e: c.yview_scroll(-3, "units"))
         c.bind("<Button-5>", lambda e: c.yview_scroll(3, "units"))
+        # Right-click: Mac uses Button-2 in Tk, Windows and Linux use Button-3
+        c.bind("<Button-2>" if sys.platform == "darwin" else "<Button-3>", self.on_right_click)
 
     def bind_keys(self):
         r = self.root
@@ -604,7 +609,8 @@ class DraftingTable:
         c = self.canvas
         return c.canvasx(c.winfo_width() / 2), c.canvasy(c.winfo_height() / 2)
 
-    def paste(self):
+    def paste(self, at=None):
+        spot = at or self.view_center()
         # 1. An image on the system clipboard (screenshots, images copied from a browser)
         if HAS_PIL and ImageGrab is not None:
             try:
@@ -612,12 +618,12 @@ class DraftingTable:
             except Exception:
                 grabbed = None
             if isinstance(grabbed, Image.Image):
-                self.place_image(grabbed.convert("RGBA"), *self.view_center())
+                self.place_image(grabbed.convert("RGBA"), *spot)
                 return
             if isinstance(grabbed, list):
                 for path in grabbed:
                     try:
-                        self.place_image(Image.open(path).convert("RGBA"), *self.view_center())
+                        self.place_image(Image.open(path).convert("RGBA"), *spot)
                     except Exception:
                         pass
                 return
@@ -644,7 +650,7 @@ class DraftingTable:
         except tk.TclError:
             text = ""
         if text.strip():
-            x, y = self.view_center()
+            x, y = spot
             pre = self.snapshot()
             it = {"id": self.new_id(), "type": "text", "x": round(x), "y": round(y), "text": text.strip(),
                   "color": self.color, "pinned": False}
@@ -773,6 +779,56 @@ class DraftingTable:
         if self.dirty and not self.confirm_discard():
             return
         self.root.destroy()
+
+    # ---------- Right-click menus ----------
+    def build_menus(self):
+        self.board_menu = tk.Menu(self.root, tearoff=0)
+        self.board_menu.add_command(label="Paste", accelerator="Ctrl+V",
+                                    command=lambda: self.paste(self.right_spot))
+        self.board_menu.add_command(label="Add note here", command=lambda: self.new_note(*self.right_spot))
+        self.board_menu.add_command(label="Add image...", command=self.add_image_dialog)
+        self.board_menu.add_separator()
+        self.board_menu.add_command(label="Select all", accelerator="Ctrl+A", command=self.select_all)
+
+        self.item_menu = tk.Menu(self.root, tearoff=0)
+        self.item_menu.add_command(label="Copy", accelerator="Ctrl+C", command=self.copy)
+        self.item_menu.add_command(label="Cut", accelerator="Ctrl+X", command=self.cut)
+        self.item_menu.add_command(label="Duplicate", accelerator="Ctrl+D", command=self.duplicate)
+        self.item_menu.add_command(label="Delete", accelerator="Delete", command=self.delete_selected)
+        self.item_menu.add_separator()
+        self.item_menu.add_command(label="Pin / Unpin", accelerator="Ctrl+K", command=self.toggle_pin)
+        self.item_menu.add_command(label="Edit text...", command=self.edit_selected_text)
+        self.item_menu.add_separator()
+        self.item_menu.add_command(label="Bigger", command=lambda: self.scale_selected(1.1))
+        self.item_menu.add_command(label="Smaller", command=lambda: self.scale_selected(0.9))
+
+    def on_right_click(self, e):
+        x, y = self.cx(e), self.cy(e)
+        self.right_spot = (x, y)
+        hit = self.hit(x, y)
+        if hit:
+            if hit["id"] not in self.sel:
+                self.sel = {hit["id"]}
+                self.redraw()
+            menu = self.item_menu
+        else:
+            menu = self.board_menu
+        try:
+            menu.tk_popup(e.x_root, e.y_root)
+        finally:
+            menu.grab_release()
+
+    def edit_selected_text(self):
+        it = next((i for i in self.items if i["id"] in self.sel and i["type"] == "text"), None)
+        if not it:
+            self.flash("Select a note to edit its text")
+            return
+        new = simpledialog.askstring("Edit note", "Text:", initialvalue=it["text"], parent=self.root)
+        if new is not None and new != it["text"]:
+            pre = self.snapshot()
+            it["text"] = new
+            self.push_undo(pre)
+            self.redraw()
 
     # ---------- Updates ----------
     def check_updates(self):
