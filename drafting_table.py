@@ -32,7 +32,7 @@ except Exception:
     Image = ImageTk = ImageGrab = None
     HAS_PIL = False
 
-APP_VERSION = "1.6"
+APP_VERSION = "1.7"
 UPDATE_BASE = "https://raw.githubusercontent.com/gamingag1331-boop/drafting-table/main/"
 APP_FILE = os.path.abspath(__file__)
 BACKUP_DIR = os.path.join(os.path.dirname(APP_FILE), "backups")
@@ -257,6 +257,8 @@ class DraftingTable:
         r.bind("<Control-plus>", lambda e: self.zoom_in())
         r.bind("<Control-minus>", lambda e: self.zoom_out())
         r.bind("<Control-0>", lambda e: self.zoom_reset())
+        r.bind("<Control-bracketright>", lambda e: self.layer_move("forward"))
+        r.bind("<Control-bracketleft>", lambda e: self.layer_move("backward"))
 
     def build_menus(self):
         self.board_menu = tk.Menu(self.root, tearoff=0)
@@ -275,6 +277,13 @@ class DraftingTable:
         self.item_menu.add_separator()
         self.item_menu.add_command(label="Pin / Unpin", accelerator="Ctrl+K", command=self.toggle_pin)
         self.item_menu.add_command(label="Edit text...", command=self.edit_selected_text)
+        self.item_menu.add_separator()
+        self.item_menu.add_command(label="Bring to front", command=lambda: self.layer_move("front"))
+        self.item_menu.add_command(label="Bring forward", accelerator="Ctrl+]",
+                                   command=lambda: self.layer_move("forward"))
+        self.item_menu.add_command(label="Send backward", accelerator="Ctrl+[",
+                                   command=lambda: self.layer_move("backward"))
+        self.item_menu.add_command(label="Send to back", command=lambda: self.layer_move("back"))
 
     def draw_grid(self):
         c = self.canvas
@@ -612,7 +621,7 @@ class DraftingTable:
         c = self.canvas
         Z = self.zoom
         c.delete("item")
-        for it in sorted(self.items, key=lambda i: 0 if i["type"] == "highlight" else 1):
+        for it in self.items:
             self.draw_item(it)
         for it in self.items:
             if it["id"] in self.sel:
@@ -804,6 +813,32 @@ class DraftingTable:
             menu.tk_popup(e.x_root, e.y_root)
         finally:
             menu.grab_release()
+
+    # ---------- Layers ----------
+    def layer_move(self, how):
+        """Move the selected items in the stack. Later in the list is drawn on top."""
+        ids = {it["id"] for it in self.items if it["id"] in self.sel}
+        if not ids:
+            return
+        pre = self.snapshot()
+        if how == "front":
+            new = [it for it in self.items if it["id"] not in ids] + [it for it in self.items if it["id"] in ids]
+        elif how == "back":
+            new = [it for it in self.items if it["id"] in ids] + [it for it in self.items if it["id"] not in ids]
+        else:
+            new = list(self.items)
+            step = 1 if how == "forward" else -1
+            order = range(len(new) - 1, -1, -1) if step > 0 else range(len(new))
+            for i in order:
+                if new[i]["id"] in ids:
+                    j = i + step
+                    if 0 <= j < len(new) and new[j]["id"] not in ids:
+                        new[i], new[j] = new[j], new[i]
+        if [it["id"] for it in new] == [it["id"] for it in self.items]:
+            return
+        self.items = new
+        self.push_undo(pre)
+        self.redraw()
 
     # ---------- Selection actions ----------
     def select_all(self):
