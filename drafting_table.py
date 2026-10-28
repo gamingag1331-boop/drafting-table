@@ -12,7 +12,10 @@ import base64
 import io
 import json
 import os
+import shutil
 import tkinter as tk
+import urllib.request
+import time
 from tkinter import colorchooser, filedialog, messagebox, simpledialog
 
 try:
@@ -34,7 +37,10 @@ HIGHLIGHT = "#fff07a"
 ACCENT = "#2f5bd3"
 COLORS = [("Ink", "#1b2b30"), ("Red", "#c8402d"), ("Blue", "#2f5bd3"), ("Green", "#2f8f5b")]
 FILLS = [("None", None), ("Yellow", "#fff3a3"), ("Pink", "#ffd6c9"), ("Blue", "#cfe8ff"), ("Green", "#d5f5dc")]
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
+UPDATE_BASE = "https://raw.githubusercontent.com/gamingag1331-boop/drafting-table/main/"
+APP_FILE = os.path.abspath(__file__)
+BACKUP_DIR = os.path.join(os.path.dirname(APP_FILE), "backups")
 BOARD_DEFAULT = "#eef2f0"
 OLD_BOARD_NAMES = {"Paper": "#eef2f0", "White": "#ffffff", "Kraft": "#efe3cc",
                    "Sage": "#e1ebe1", "Sky": "#e3eef8"}
@@ -60,6 +66,20 @@ STROKE_TYPES = ("stroke", "highlight")
 LINE_TYPES = ("line", "arrow")
 TOOL_TO_TYPE = {"pen": "stroke", "highlight": "highlight", "line": "line", "arrow": "arrow"}
 TOOL_WIDTH = {"stroke": 3, "highlight": 22, "line": 2.5, "arrow": 2.5}
+
+
+def fetch_update_file(name):
+    """Download one file from the project on GitHub. Only https addresses under UPDATE_BASE are used."""
+    url = UPDATE_BASE + name
+    if not url.startswith("https://raw.githubusercontent.com/"):
+        raise ValueError("update address is not allowed")
+    req = urllib.request.Request(url, headers={"User-Agent": "DraftingTable"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.read()
+
+
+def version_tuple(v):
+    return tuple(int(p) for p in str(v).split("."))
 
 
 def dist_seg(p, a, b):
@@ -144,7 +164,8 @@ class DraftingTable:
                    ("Paste", self.paste), ("Duplicate", self.duplicate), ("Delete", self.delete_selected),
                    ("Pin / Unpin", self.toggle_pin), ("Add image", self.add_image_dialog),
                    ("Bigger", lambda: self.scale_selected(1.1)), ("Smaller", lambda: self.scale_selected(0.9)),
-                   ("Open", self.open_file), ("Save", self.save), ("Clear", self.clear_board)]
+                   ("Open", self.open_file), ("Save", self.save), ("Clear", self.clear_board),
+                   ("Check for updates", self.check_updates)]
         for text, cmd in actions:
             tk.Button(bar2, text=text, command=cmd).pack(side=tk.LEFT, padx=2)
 
@@ -752,6 +773,54 @@ class DraftingTable:
         if self.dirty and not self.confirm_discard():
             return
         self.root.destroy()
+
+    # ---------- Updates ----------
+    def check_updates(self):
+        try:
+            info = json.loads(fetch_update_file("version.json").decode("utf-8"))
+            latest = str(info["version"])
+            name = str(info.get("file", "drafting_table.py"))
+            if name != "drafting_table.py":
+                raise ValueError("update names an unexpected file")
+            version_tuple(latest)
+        except Exception as err:
+            messagebox.showerror("Could not check for updates",
+                                 "Could not reach the update server. Check your internet connection.\n\n"
+                                 f"Details: {err}")
+            return
+        if version_tuple(latest) <= version_tuple(APP_VERSION):
+            messagebox.showinfo("Up to date", f"You have the latest version ({APP_VERSION}).")
+            return
+        if not messagebox.askyesno(
+                "Update available",
+                f"Version {latest} is available. You have {APP_VERSION}.\n\n"
+                "Install it now? A backup of your current version is saved first, and your boards are not changed. "
+                "Close and reopen the app afterwards."):
+            return
+        try:
+            text = fetch_update_file(name).decode("utf-8")
+            compile(text, name, "exec")  # checks it is valid Python without running it
+            if f'APP_VERSION = "{latest}"' not in text:
+                raise ValueError("the downloaded file does not match the version it claims")
+        except Exception as err:
+            messagebox.showerror("Update stopped",
+                                 "The download was not installed. Your current app is unchanged.\n\n"
+                                 f"Details: {err}")
+            return
+        try:
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            shutil.copy2(APP_FILE, os.path.join(BACKUP_DIR, f"drafting_table_{APP_VERSION}_{stamp}.py"))
+            tmp = APP_FILE + ".new"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp, APP_FILE)
+        except OSError as err:
+            messagebox.showerror("Update stopped", f"Could not replace the app file. Your current app is unchanged.\n\n{err}")
+            return
+        messagebox.showinfo("Updated",
+                            f"Installed version {latest}. Close and reopen the app to use it.\n\n"
+                            "The old version is saved in the backups folder.")
 
     # ---------- Local API (used by the Claude and ChatGPT bridges) ----------
     def api_board(self):
