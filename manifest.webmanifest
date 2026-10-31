@@ -1,0 +1,9 @@
+{
+  "name": "Drafting Table",
+  "short_name": "Drafting",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#eef2f0",
+  "theme_color": "#ffffff"
+}
